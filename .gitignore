@@ -4,3 +4,58 @@ music/
 *.swp
 *.tmp
 
+
+# ==========================================
+# RK3576 Camera / RKNN generated files
+# ==========================================
+
+# Camera captured frames
+/frame_4k.nv12
+/frame_4k.png
+
+# AI model binaries
+/rknn_test/model/*.rknn
+
+# Calibration dataset
+/rknn_test/src/calibration_capture/
+/rknn_test/src/calibration_png/
+
+# COCO evaluation generated results
+/rknn_test/coco_eval/results5000/
+/rknn_test/coco_eval/*.log
+/rknn_test/coco_eval/*_predictions.json
+
+# Runtime logs
+/rknn_test/src/*.log
+
+# Generated image / raw buffers
+/rknn_test/src/*.raw
+/rknn_test/src/*.ppm
+/rknn_test/src/*.jpg
+/rknn_test/src/*.png
+
+# Camera test executables
+/camera_test/dmabuf_cache_benchmark
+/camera_test/rga_benchmark
+/camera_test/sdl_display_benchmark
+/camera_test/system_profiler
+/camera_test/test
+/camera_test/v4l2_dma_buf
+/camera_test/v4l2_mmap
+
+# RKNN executables
+/rknn_test/rknn_inspect
+/rknn_test/src/camera_rga_letterbox
+/rknn_test/src/camera_rga_rknn_int8_native_profile
+/rknn_test/src/camera_rga_rknn_loop_profile
+/rknn_test/src/camera_rga_rknn_once
+/rknn_test/src/capture_calibration_auto
+/rknn_test/src/capture_calibration_images
+/rknn_test/src/query_rknn_tensor_attr
+/rknn_test/src/rknn_coco_eval
+/rknn_test/src/rknn_fp16_int8_benchmark
+/rknn_test/src/rknn_input_ab_benchmark
+/rknn_test/src/rknn_io_mem_uint8_test
+/rknn_test/src/rknn_run
+/rknn_test/src/rknn_run_once
+/rknn_test/srcR_640_preview.jpg

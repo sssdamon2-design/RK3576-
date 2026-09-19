@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -13,4 +15,9 @@ struct ImageFrame
 
     uint64_t timestamp_ns = 0;
     uint64_t frame_id = 0;
+
+    // 本地取帧时刻用于帧龄；驱动 timestamp_ns 的时钟域可能不同。
+    std::chrono::steady_clock::time_point received_at{};
+    std::vector<uint32_t> plane_strides;
+    std::vector<std::size_t> plane_sizes;
 };

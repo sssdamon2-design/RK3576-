@@ -1,0 +1,10 @@
+/build*/
+/models/
+/runtime/
+/sdk/
+*.rkllm
+*.rknn
+*.onnx
+*.so
+*.so.*
+*.dll

@@ -7,6 +7,7 @@
 
 #include <fcntl.h>
 #include <linux/videodev2.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -47,17 +48,13 @@ VideoCapture::~VideoCapture()
 
 bool VideoCapture::initialize()
 {
-    fd_ = ::open(device_.c_str(), O_RDWR);
+    shutdown();
+    last_error_.clear();
+    fd_ = ::open(device_.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
 
     if (fd_ < 0)
     {
-        std::cerr << "Failed to open "
-                  << device_
-                  << ": "
-                  << std::strerror(errno)
-                  << std::endl;
-
-        return false;
+        return fail("open " + device_);
     }
 
     if (!configureDevice())
@@ -88,29 +85,19 @@ bool VideoCapture::configureDevice()
 
     if (xioctl(fd_, VIDIOC_QUERYCAP, &capability) < 0)
     {
-        std::cerr << "VIDIOC_QUERYCAP failed"
-                  << std::endl;
-        return false;
+        return fail("VIDIOC_QUERYCAP");
     }
 
-    if (!(capability.capabilities &V4L2_CAP_VIDEO_CAPTURE_MPLANE))
+    const uint32_t caps = (capability.capabilities & V4L2_CAP_DEVICE_CAPS)
+        ? capability.device_caps : capability.capabilities;
+    if (!(caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE))
     {
-        std::cerr
-            << "Device does not support "
-            << "V4L2 multi-planar capture"
-            << std::endl;
-
-        return false;
+        return fail("Device does not support V4L2 multi-planar capture", false);
     }
 
-    if (!(capability.capabilities &V4L2_CAP_STREAMING))
+    if (!(caps & V4L2_CAP_STREAMING))
     {
-        std::cerr
-            << "Device does not support "
-            << "V4L2 streaming"
-            << std::endl;
-
-        return false;
+        return fail("Device does not support V4L2 streaming", false);
     }
 
     v4l2_format format{};
@@ -126,9 +113,7 @@ bool VideoCapture::configureDevice()
 
     if (xioctl(fd_, VIDIOC_S_FMT, &format) < 0)
     {
-        std::cerr << "VIDIOC_S_FMT failed"
-                  << std::endl;
-        return false;
+        return fail("VIDIOC_S_FMT");
     }
 
     width_ = format.fmt.pix_mp.width;
@@ -139,13 +124,14 @@ bool VideoCapture::configureDevice()
     num_planes_ =
         format.fmt.pix_mp.num_planes;
 
-    if (num_planes_ == 0)
+    if (num_planes_ == 0 || num_planes_ > VIDEO_MAX_PLANES)
     {
-        std::cerr
-            << "Driver returned zero planes"
-            << std::endl;
-        return false;
+        return fail("Driver returned invalid plane count", false);
     }
+
+    plane_strides_.clear();
+    for (uint32_t p = 0; p < num_planes_; ++p)
+        plane_strides_.push_back(format.fmt.pix_mp.plane_fmt[p].bytesperline);
 
     std::cout
         << "Camera format: "
@@ -176,20 +162,12 @@ bool VideoCapture::initMMap()
             VIDIOC_REQBUFS,
             &request) < 0)
     {
-        std::cerr
-            << "VIDIOC_REQBUFS failed"
-            << std::endl;
-
-        return false;
+        return fail("VIDIOC_REQBUFS");
     }
 
     if (request.count < 2)
     {
-        std::cerr
-            << "Not enough V4L2 buffers"
-            << std::endl;
-
-        return false;
+        return fail("Not enough V4L2 buffers", false);
     }
 
     buffers_.resize(request.count);
@@ -219,12 +197,11 @@ bool VideoCapture::initMMap()
                 VIDIOC_QUERYBUF,
                 &buffer) < 0)
         {
-            std::cerr
-                << "VIDIOC_QUERYBUF failed"
-                << std::endl;
-
-            return false;
+            return fail("VIDIOC_QUERYBUF buffer=" + std::to_string(i));
         }
+
+        if (buffer.length != num_planes_)
+            return fail("VIDIOC_QUERYBUF plane count mismatch", false);
 
         buffers_[i].planes.resize(
             num_planes_
@@ -247,11 +224,7 @@ bool VideoCapture::initMMap()
 
             if (mapped == MAP_FAILED)
             {
-                std::cerr
-                    << "mmap failed"
-                    << std::endl;
-
-                return false;
+                return fail("mmap buffer=" + std::to_string(i) + " plane=" + std::to_string(p));
             }
 
             buffers_[i].planes[p].start =
@@ -301,11 +274,7 @@ bool VideoCapture::startStreaming()
                 VIDIOC_QBUF,
                 &buffer) < 0)
         {
-            std::cerr
-                << "VIDIOC_QBUF failed"
-                << std::endl;
-
-            return false;
+            return fail("VIDIOC_QBUF buffer=" + std::to_string(i));
         }
     }
 
@@ -317,11 +286,7 @@ bool VideoCapture::startStreaming()
             VIDIOC_STREAMON,
             &type) < 0)
     {
-        std::cerr
-            << "VIDIOC_STREAMON failed"
-            << std::endl;
-
-        return false;
+        return fail("VIDIOC_STREAMON");
     }
 
     streaming_ = true;
@@ -334,6 +299,35 @@ bool VideoCapture::captureFrame(
     ImageFrame& frame
 )
 {
+    const auto status = captureFrame(frame, 200);
+    if (status == CaptureStatus::Timeout) fail("captureFrame timed out or was interrupted", false);
+    return status == CaptureStatus::Frame;
+}
+
+VideoCapture::CaptureStatus VideoCapture::captureFrame(ImageFrame& frame, int timeout_ms)
+{
+    if (!streaming_ || fd_ < 0 || timeout_ms < 0)
+    {
+        fail("captureFrame requires initialized stream and nonnegative timeout", false);
+        return CaptureStatus::Error;
+    }
+    pollfd descriptor{};
+    descriptor.fd = fd_;
+    descriptor.events = POLLIN;
+    const int ready = ::poll(&descriptor, 1, timeout_ms);
+    if (ready == 0 || (ready < 0 && errno == EINTR)) return CaptureStatus::Timeout;
+    if (ready < 0)
+    {
+        fail("poll");
+        return CaptureStatus::Error;
+    }
+    if (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))
+    {
+        fail("poll device error revents=" + std::to_string(descriptor.revents), false);
+        return CaptureStatus::Error;
+    }
+    if (!(descriptor.revents & POLLIN)) return CaptureStatus::Timeout;
+
     std::vector<v4l2_plane>
         planes(num_planes_);
 
@@ -353,24 +347,27 @@ bool VideoCapture::captureFrame(
             VIDIOC_DQBUF,
             &buffer) < 0)
     {
-        std::cerr
-            << "VIDIOC_DQBUF failed: "
-            << std::strerror(errno)
-            << std::endl;
-
-        return false;
+        // poll 后状态仍可能变化，O_NONBLOCK 保证 DQBUF 不会无限等待。
+        if (errno == EAGAIN) return CaptureStatus::Timeout;
+        fail("VIDIOC_DQBUF");
+        return CaptureStatus::Error;
     }
 
     if (buffer.index >= buffers_.size())
     {
-        std::cerr
-            << "Invalid buffer index"
-            << std::endl;
+        fail("VIDIOC_DQBUF invalid buffer index", false);
+        return CaptureStatus::Error;
+    }
 
-        return false;
+    if (buffer.length != num_planes_ || (buffer.flags & V4L2_BUF_FLAG_ERROR))
+    {
+        fail("VIDIOC_DQBUF invalid planes or V4L2_BUF_FLAG_ERROR", false);
+        return CaptureStatus::Error; // CameraService 随后 STREAMOFF，回收所有缓冲。
     }
 
     ImageFrame captured;
+    captured.received_at = std::chrono::steady_clock::now();
+    captured.plane_strides = plane_strides_;
 
     captured.width = width_;
     captured.height = height_;
@@ -395,6 +392,13 @@ bool VideoCapture::captureFrame(
          p < num_planes_;
          ++p)
     {
+        if (planes[p].data_offset > planes[p].bytesused ||
+            planes[p].bytesused > buffers_[buffer.index].planes[p].length)
+        {
+            fail("VIDIOC_DQBUF plane bounds invalid, plane=" + std::to_string(p), false);
+            return CaptureStatus::Error;
+        }
+        captured.plane_sizes.push_back(planes[p].bytesused - planes[p].data_offset);
         if (planes[p].bytesused >
             planes[p].data_offset)
         {
@@ -423,6 +427,7 @@ bool VideoCapture::captureFrame(
                 offset;
         }
 
+        if (bytes == 0) continue;
         const uint8_t* start =
             static_cast<const uint8_t*>(
                 buffers_[buffer.index]
@@ -443,16 +448,13 @@ bool VideoCapture::captureFrame(
             VIDIOC_QBUF,
             &buffer) < 0)
     {
-        std::cerr
-            << "VIDIOC_QBUF failed"
-            << std::endl;
-
-        return false;
+        fail("VIDIOC_QBUF after capture");
+        return CaptureStatus::Error;
     }
 
     frame = std::move(captured);
 
-    return true;
+    return CaptureStatus::Frame;
 }
 
 
@@ -466,11 +468,12 @@ void VideoCapture::stopStreaming()
     v4l2_buf_type type =
         V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
-    ::ioctl(
+    if (::ioctl(
         fd_,
         VIDIOC_STREAMOFF,
         &type
-    );
+    ) < 0)
+        std::cerr << "VIDIOC_STREAMOFF: " << std::strerror(errno) << std::endl;
 
     streaming_ = false;
 }
@@ -484,10 +487,11 @@ void VideoCapture::releaseMMap()
         {
             if (plane.start != nullptr)
             {
-                ::munmap(
+                if (::munmap(
                     plane.start,
                     plane.length
-                );
+                ) < 0)
+                    std::cerr << "munmap: " << std::strerror(errno) << std::endl;
 
                 plane.start = nullptr;
                 plane.length = 0;
@@ -507,7 +511,15 @@ void VideoCapture::shutdown()
 
     if (fd_ >= 0)
     {
-        ::close(fd_);
+        if (::close(fd_) < 0)
+            std::cerr << "close camera: " << std::strerror(errno) << std::endl;
         fd_ = -1;
     }
+}
+
+bool VideoCapture::fail(const std::string& operation, bool include_errno)
+{
+    last_error_ = device_ + ": " + operation;
+    if (include_errno) last_error_ += ": " + std::string(std::strerror(errno));
+    return false;
 }
